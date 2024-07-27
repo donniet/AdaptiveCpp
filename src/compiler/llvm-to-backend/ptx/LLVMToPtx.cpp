@@ -84,17 +84,24 @@ private:
     
     std::string CUDAPath = HIPSYCL_CUDA_PATH;
     std::vector<std::string> SubDir {"nvvm", "libdevice"};
-    std::string BitcodeDir = common::filesystem::join_path(CUDAPath, SubDir);
+    std::string BitcodeDir[2];
+    BitcodeDir[0] = common::filesystem::join_path(CUDAPath, SubDir);
+    
+    SubDir = std::vector<std::string> {"libdevice"};
+    BitcodeDir[1] = common::filesystem::join_path(CUDAPath, SubDir);
 
-    try {
-      auto Files = common::filesystem::list_regular_files(BitcodeDir);
-      for(const auto& F : Files) {
-        if (F.find("libdevice.") != std::string::npos && F.find(".bc") != std::string::npos) {
-          Out = F;
-          return true;
+    for(int i = 0; i < sizeof(BitcodeDir)/sizeof(BitcodeDir[0]); i++) {
+      HIPSYCL_DEBUG_INFO << "libdevice bitcodeDir (option " << i+1 << "): " << BitcodeDir[i] << "\n";
+      try {
+        auto Files = common::filesystem::list_regular_files(BitcodeDir[i]);
+        for(const auto& F : Files) {
+          if (F.find("libdevice.") != std::string::npos && F.find(".bc") != std::string::npos) {
+            Out = F;
+            return true;
+          }
         }
-      }
-    }catch(...) { /* false will be returned anyway at this point */ }
+      }catch(...) { /* false will be returned anyway at this point */ }
+    }
 
     return false;
   }
