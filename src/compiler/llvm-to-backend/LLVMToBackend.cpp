@@ -1,41 +1,30 @@
 /*
- * This file is part of hipSYCL, a SYCL implementation based on CUDA/HIP
+ * This file is part of AdaptiveCpp, an implementation of SYCL and C++ standard
+ * parallelism for CPUs and GPUs.
  *
- * Copyright (c) 2019-2022 Aksel Alpay
- * All rights reserved.
+ * Copyright The AdaptiveCpp Contributors
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- * 1. Redistributions of source code must retain the above copyright notice, this
- *    list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright notice,
- *    this list of conditions and the following disclaimer in the documentation
- *    and/or other materials provided with the distribution.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
- * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
- * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
- * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
- * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
- * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
- * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ * AdaptiveCpp is released under the BSD 2-Clause "Simplified" License.
+ * See file LICENSE in the project root for full license details.
  */
-
+// SPDX-License-Identifier: BSD-2-Clause
 #include "hipSYCL/common/debug.hpp"
 #include "hipSYCL/compiler/llvm-to-backend/AddressSpaceInferencePass.hpp"
+#include "hipSYCL/compiler/llvm-to-backend/DeadArgumentEliminationPass.hpp"
 #include "hipSYCL/compiler/llvm-to-backend/GlobalSizesFitInI32OptPass.hpp"
+#include "hipSYCL/compiler/llvm-to-backend/GlobalInliningAttributorPass.hpp"
 #include "hipSYCL/compiler/llvm-to-backend/KnownGroupSizeOptPass.hpp"
 #include "hipSYCL/compiler/llvm-to-backend/LLVMToBackend.hpp"
 #include "hipSYCL/compiler/llvm-to-backend/Utils.hpp"
 #include "hipSYCL/compiler/sscp/IRConstantReplacer.hpp"
 #include "hipSYCL/compiler/sscp/KernelOutliningPass.hpp"
+#include "hipSYCL/compiler/utils/ProcessFunctionAnnotationsPass.hpp"
 #include "hipSYCL/glue/llvm-sscp/s2_ir_constants.hpp"
 
 #include <cstdint>
+
+#include <llvm/Transforms/IPO/AlwaysInliner.h>
+#include <llvm/ADT/APFloat.h>
 #include <llvm/IR/Attributes.h>
 #include <llvm/IR/DerivedTypes.h>
 #include <llvm/IR/DiagnosticInfo.h>
@@ -49,6 +38,7 @@
 #include <llvm/Passes/PassBuilder.h>
 #include <llvm/Support/Error.h>
 #include <llvm/Bitcode/BitcodeWriter.h>
+#include <llvm/Transforms/IPO/AlwaysInliner.h>
 #include <string>
 
 namespace hipsycl {
@@ -95,11 +85,44 @@ void setFastMathFunctionAttribs(llvm::Module& M) {
 }
 
 
+class InstructionCleanupPass : public llvm::PassInfoMixin<InstructionCleanupPass> {
+public:
+
+  llvm::PreservedAnalyses run(llvm::Module &M,
+                              llvm::ModuleAnalysisManager &MAM) {
+    
+    llvm::SmallVector<llvm::CallBase*> CallsToRemove;
+    for(auto& F : M) {
+      for(auto& BB : F) {
+        for(auto& I : BB) {
+          if(llvm::CallBase* CB = llvm::dyn_cast<llvm::CallBase>(&I)) {
+            // these instructions can sometimes appear as a byproduct of some transformations
+            // even without dynamic allocas, but they are generally unsupported on device
+            // backends.
+            if (CB->getCalledFunction()->getName().startswith("llvm.stacksave") ||
+                CB->getCalledFunction()->getName().startswith("llvm.stackrestore"))
+              CallsToRemove.push_back(CB);
+          }
+        }
+      }
+    }
+
+    for(auto* C : CallsToRemove) {
+      C->replaceAllUsesWith(llvm::UndefValue::get(C->getType()));
+      C->eraseFromParent();
+    }
+    return llvm::PreservedAnalyses::none();
+  }
+};
+
+
 }
 
 LLVMToBackendTranslator::LLVMToBackendTranslator(int S2IRConstantCurrentBackendId,
-  const std::vector<std::string>& OutliningEPs)
-: S2IRConstantBackendId(S2IRConstantCurrentBackendId), OutliningEntrypoints{OutliningEPs} {}
+                                                 const std::vector<std::string> &OutliningEPs,
+                                                 const std::vector<std::string> &KernelNames)
+    : S2IRConstantBackendId(S2IRConstantCurrentBackendId),
+      OutliningEntrypoints{OutliningEPs}, Kernels{KernelNames} {}
 
 bool LLVMToBackendTranslator::setBuildFlag(const std::string &Flag) {
   HIPSYCL_DEBUG_INFO << "LLVMToBackend: Using build flag: " << Flag << "\n";
@@ -205,11 +228,14 @@ bool LLVMToBackendTranslator::prepareIR(llvm::Module &M) {
   // This also means that we cannot error yet if we cannot resolve all symbols :(
   resolveExternalSymbols(M);
 
-  HIPSYCL_DEBUG_INFO << "LLVMToBackend: Applying S2 IR constants...\n";
-  for(auto& A : S2IRConstantApplicators) {
-    HIPSYCL_DEBUG_INFO << "LLVMToBackend: Setting S2 IR constant " << A.first << "\n";
+  HIPSYCL_DEBUG_INFO << "LLVMToBackend: Applying specializations and S2 IR constants...\n";
+  for(auto& A : SpecializationApplicators) {
+    HIPSYCL_DEBUG_INFO << "LLVMToBackend: Processing specialization " << A.first << "\n";
     A.second(M);
   }
+  // Return error in case applying specializations has caused error list to be populated
+  if(!Errors.empty())
+    return false;
 
   bool ContainsUnsetIRConstants = false;
   bool FlavoringSuccessful = false;
@@ -228,7 +254,7 @@ bool LLVMToBackendTranslator::prepareIR(llvm::Module &M) {
     KernelOutliningPass KP{OutliningEntrypoints};
     KP.run(M, MAM);
 
-    // These optimizations should be run before __hipsycl_sscp_* builtins
+    // These optimizations should be run before __acpp_sscp_* builtins
     // are resolved, so before backend bitcode libraries are linked. We thus
     // run them prior to flavoring.
     KnownGroupSizeOptPass GroupSizeOptPass{KnownGroupSizeX, KnownGroupSizeY, KnownGroupSizeZ};
@@ -237,26 +263,26 @@ bool LLVMToBackendTranslator::prepareIR(llvm::Module &M) {
     GroupSizeOptPass.run(M, MAM);
     SizesAsIntOptPass.run(M, MAM);
 
-    HIPSYCL_DEBUG_INFO << "LLVMToBackend: Adding backend-specific flavor to IR...\n";
-
-    FlavoringSuccessful = this->toBackendFlavor(M, PH);
-
     // Before optimizing, make sure everything has internal linkage to
     // help inlining. All linking should have occured by now, except
     // for backend builtin libraries like libdevice etc
-    for(auto & F : M) {
-      // Ignore kernels and intrinsics
-      if(!F.isIntrinsic() && !this->isKernelAfterFlavoring(F)) {
-        // Ignore undefined functions
-        if(!F.empty()) {
-          F.setLinkage(llvm::GlobalValue::InternalLinkage);
-          // Some backends (amdgpu) require inlining, for others it
-          // just cleans up the code.
-          if(!F.hasFnAttribute(llvm::Attribute::AlwaysInline))
-            F.addFnAttr(llvm::Attribute::AlwaysInline);
-        }
-      }
-    }
+
+    // First inling stage is prior to backend flavoring. This helps
+    // for some backends which introduces call conventions that complicate inlining
+    // (e.g. spir_func)
+    GlobalInliningAttributorPass InliningPass{Kernels};
+    InliningPass.run(M, MAM);
+    MAM.clear();
+    llvm::AlwaysInlinerPass AIP;
+    AIP.run(M, MAM);
+
+    InstructionCleanupPass ICP;
+    ICP.run(M, MAM);
+
+    HIPSYCL_DEBUG_INFO << "LLVMToBackend: Adding backend-specific flavor to IR...\n";
+    FlavoringSuccessful = this->toBackendFlavor(M, PH);
+    // Inline again to handle builtin definitions pulled in by backend flavors
+    InliningPass.run(M, MAM);
 
     if(FlavoringSuccessful) {
       // Run optimizations
@@ -264,17 +290,35 @@ bool LLVMToBackendTranslator::prepareIR(llvm::Module &M) {
 
       if(IsFastMath)
         setFastMathFunctionAttribs(M);
+
+      // Remove argument_used hints, which are no longer needed once we enter optimization stage.
+      // This is primarily needed for dynamic functions.
+      utils::ProcessFunctionAnnotationPass PFA({"argument_used"});
+      PFA.run(M, MAM);
+
+      MAM.clear();
+
       OptimizationSuccessful = optimizeFlavoredIR(M, PH);
 
       if(!OptimizationSuccessful) {
         this->registerError("LLVMToBackend: Optimization failed");
       }
 
+      for(const auto& Entry : FunctionsForDeadArgumentElimination) {
+        if(auto* F = M.getFunction(Entry.first)) {
+          if(isKernelAfterFlavoring(*F)) {
+            runKernelDeadArgumentElimination(M, F, PH, *Entry.second);
+          }
+        }
+      }
+      llvm::AlwaysInlinerPass AIP;
+      AIP.run(M, MAM);
+
       S2IRConstant::forEachS2IRConstant(M, [&](S2IRConstant C) {
         if (C.isValid()) {
           if (!C.isInitialized()) {
             ContainsUnsetIRConstants = true;
-            this->registerError("LLVMToBackend: hipSYCL S2IR constant was not set: " +
+            this->registerError("LLVMToBackend: AdaptiveCpp S2IR constant was not set: " +
                                 C.getGlobalVariable()->getName().str());
           }
         }
@@ -356,9 +400,146 @@ bool LLVMToBackendTranslator::linkBitcodeFile(llvm::Module &M, const std::string
 }
 
 void LLVMToBackendTranslator::setS2IRConstant(const std::string &name, const void *ValueBuffer) {
-  S2IRConstantApplicators[name] = [=](llvm::Module& M){
+  SpecializationApplicators[name] = [=](llvm::Module& M){
     S2IRConstant C = S2IRConstant::getFromConstantName(M, name);
     C.set(ValueBuffer);
+  };
+}
+
+void LLVMToBackendTranslator::specializeKernelArgument(const std::string &KernelName, int ParamIndex,
+                                const void *ValueBuffer) {
+  std::string Id = KernelName+"__specialized_kernel_argument_"+std::to_string(ParamIndex);
+  SpecializationApplicators[Id] = [=](llvm::Module& M) {
+    if(auto* F = M.getFunction(KernelName)) {
+      if(F->getFunctionType()->getNumParams() > ParamIndex && !F->isDeclaration()) {
+        
+        llvm::Type* ParamType = F->getFunctionType()->getParamType(ParamIndex);
+        if (ParamType->isIntegerTy() || ParamType->isPointerTy() || ParamType->isFloatTy() ||
+            ParamType->isDoubleTy()) {
+          std::string GetterName = "__specialization_getter_"+Id;
+          llvm::Function *GetConstant = llvm::dyn_cast<llvm::Function>(
+              M.getOrInsertFunction(GetterName, ParamType).getCallee());
+          
+          if(!GetConstant)
+            return;
+          GetConstant->addFnAttr(llvm::Attribute::AlwaysInline);
+
+          llvm::Constant *ReturnedValue = nullptr;
+          std::size_t ParamByteSize = M.getDataLayout().getTypeSizeInBits(ParamType) / CHAR_BIT;
+
+          if(ParamType->isIntegerTy()) {
+            uint64_t Value = 0;
+            std::memcpy(&Value, ValueBuffer, ParamByteSize);
+            ReturnedValue = llvm::ConstantInt::get(
+              M.getContext(), llvm::APInt(ParamType->getIntegerBitWidth(), Value));
+          } else if(ParamType->isFloatTy()) {
+            float Value = 0.0f;
+            std::memcpy(&Value, ValueBuffer, ParamByteSize);
+            ReturnedValue = llvm::ConstantFP::get(M.getContext(), llvm::APFloat(Value));
+          } else if(ParamType->isDoubleTy()) {
+            double Value = 0.0;
+            std::memcpy(&Value, ValueBuffer, ParamByteSize);
+            ReturnedValue = llvm::ConstantFP::get(M.getContext(), llvm::APFloat(Value));
+          } else if(ParamType->isPointerTy()) {
+            uint64_t Value = 0;
+            std::memcpy(&Value, ValueBuffer, ParamByteSize);
+            auto* IntPtr = llvm::ConstantInt::get(
+              M.getContext(), llvm::APInt(ParamByteSize * CHAR_BIT, Value));
+            ReturnedValue = llvm::ConstantExpr::getIntToPtr(
+                IntPtr, ParamType);
+          }
+          if(!ReturnedValue) {
+            HIPSYCL_DEBUG_WARNING << "LLVMToBackend: Could not specialize kernel argument " << Id
+                                  << " due to unsupported parameter type\n";
+            return;
+          }
+
+          llvm::BasicBlock *BB =
+              llvm::BasicBlock::Create(M.getContext(), "", GetConstant);
+
+          llvm::ReturnInst::Create(M.getContext(), ReturnedValue, BB);
+
+          llvm::Instruction* InsertionPt = &(*F->getEntryBlock().getFirstInsertionPt());
+          auto* FnCall = llvm::CallInst::Create(llvm::FunctionCallee(GetConstant),
+                                  llvm::ArrayRef<llvm::Value *>{}, "", InsertionPt);
+          F->getArg(ParamIndex)->replaceNonMetadataUsesWith(FnCall);
+        }
+      }
+    }
+  };
+}
+
+void LLVMToBackendTranslator::specializeFunctionCalls(
+    const std::string &FuncName, const std::vector<std::string> &ReplacementCalls,
+    bool OverrideOnlyUndefined) {
+  std::string Id = "__specialized_function_call_"+FuncName;
+  SpecializationApplicators[Id] = [=](llvm::Module &M) {
+    HIPSYCL_DEBUG_INFO << "LLVMToBackend: Specializing function calls to " << FuncName << " to:\n";
+    for(const auto& s : ReplacementCalls)
+      HIPSYCL_DEBUG_INFO << "LLVMToBackend:   " << s << "\n";
+    if(auto* F = M.getFunction(FuncName)) {
+      if((!OverrideOnlyUndefined || F->isDeclaration()) && !ReplacementCalls.empty()) {
+        llvm::Value* ReplacementValue;
+        if(ReplacementCalls.size() == 1){
+          llvm::Function* ReplacementF = M.getFunction(ReplacementCalls[0]);
+          ReplacementValue = ReplacementF;
+
+          if(!ReplacementValue) {
+            registerError("LLVMToBackend: Could not find function call specialization target " +
+                        ReplacementCalls[0] + ", was the function emitted to device code?");
+            return;
+          }
+          if(ReplacementF->getFunctionType() != F->getFunctionType()) {
+            registerError("LLVMToBackend: Specialization function " + ReplacementCalls[0] +
+                          " has incompatible type for specialization of " + FuncName);
+            return;
+          }
+        } else {
+          llvm::SmallVector<llvm::Function*, 16> ReplacementFs;
+
+          if (!F->getReturnType()->isVoidTy()) {
+            registerError("LLVMToBackend: Specialization of function calls using a function call "
+                          "list is only possible if the original and all replacement functions "
+                          "have void return type.");
+            return;
+          }
+          for(const auto& FName : ReplacementCalls) {
+            auto* RetrievedF = M.getFunction(FName);
+            if(!RetrievedF) {
+              registerError("LLVMToBackend: Could not find function call specialization target " +
+                            FName + ", was the function emitted to device code?");
+              return;
+            }
+            if(RetrievedF->getFunctionType() != F->getFunctionType()) {
+              registerError("LLVMToBackend: Specialization function " + FName +
+                          " has incompatible type for specialization of " + FuncName);
+              return;
+            }
+            ReplacementFs.push_back(RetrievedF);
+          }
+          auto ReplacementWrapperFuncCallee = M.getOrInsertFunction(Id, F->getFunctionType(), F->getAttributes());
+          if (auto *ReplacementWrapperF =
+                  static_cast<llvm::Function *>(ReplacementWrapperFuncCallee.getCallee())) {
+            auto BB = llvm::BasicBlock::Create(M.getContext(), "entry",
+                                               ReplacementWrapperF);
+            for(auto* F : ReplacementFs) {
+              llvm::SmallVector<llvm::Value*> Args;
+              for(int i = 0; i < F->getFunctionType()->getNumParams(); ++i)
+                Args.push_back(ReplacementWrapperF->getArg(i));
+
+              llvm::CallInst::Create(llvm::FunctionCallee{F},
+                                     llvm::ArrayRef<llvm::Value *>{Args}, "", BB);
+            }                                            
+            llvm::ReturnInst::Create(M.getContext(), BB);
+          }
+          ReplacementValue  = ReplacementWrapperFuncCallee.getCallee();
+        }
+
+        F->replaceUsesWithIf(ReplacementValue, [=](llvm::Use& U) {
+          return llvm::isa<llvm::CallBase>(U.getUser());
+        });
+      }
+    }
   };
 }
 
@@ -430,11 +611,49 @@ void LLVMToBackendTranslator::resolveExternalSymbols(llvm::Module& M) {
   }
 }
 
+void LLVMToBackendTranslator::enableDeadArgumentElminiation(
+    const std::string &FunctionName, std::vector<int> *RetainedArgumentIndices) {
+  this->FunctionsForDeadArgumentElimination.push_back(
+      std::make_pair(FunctionName, RetainedArgumentIndices));
+}
+
+const std::vector<std::pair<std::string, std::vector<int> *>> &
+LLVMToBackendTranslator::getDeadArgumentEliminationConfig() const {
+  return FunctionsForDeadArgumentElimination;
+}
+
 void LLVMToBackendTranslator::setFailedIR(llvm::Module& M) {
   llvm::raw_string_ostream Stream{ErroringCode};
   llvm::WriteBitcodeToFile(M, Stream);
 }
 
+void LLVMToBackendTranslator::runKernelDeadArgumentElimination(
+    llvm::Module &M, llvm::Function *F, PassHandler &PH, std::vector<int> &RetainedIndicesOut) {
+  std::string FName = F->getName().str();
+
+  llvm::SmallVector<int> RetainedArgumentIndices;
+  std::function<void(llvm::Function *, llvm::Function *)> KernelMigrationHandler =
+      [&, this](llvm::Function *Old, llvm::Function *New) {
+        this->migrateKernelProperties(Old, New);
+      };
+  DeadArgumentEliminationPass DAE{F, &RetainedArgumentIndices, &KernelMigrationHandler};
+  DAE.run(M, *PH.ModuleAnalysisManager);
+
+  auto *DAEOutput = &RetainedIndicesOut;
+  if (DAEOutput) {
+    DAEOutput->resize(RetainedArgumentIndices.size());
+    std::copy(RetainedArgumentIndices.begin(), RetainedArgumentIndices.end(), DAEOutput->begin());
+
+    std::string RetainedArgsStr;
+    for (int i = 0; i < DAEOutput->size(); ++i) {
+      RetainedArgsStr += std::to_string(DAEOutput->at(i)) + " ";
+    }
+
+    HIPSYCL_DEBUG_INFO << "LLVMToBackend: Dead argument elimination for " << FName
+                       << " has resulted in these arguments being retained: " << RetainedArgsStr
+                       << "\n";
+  }
+}
 }
 }
 

@@ -1,36 +1,23 @@
 /*
- * This file is part of hipSYCL, a SYCL implementation based on CUDA/HIP
+ * This file is part of AdaptiveCpp, an implementation of SYCL and C++ standard
+ * parallelism for CPUs and GPUs.
  *
- * Copyright (c) 2022 Aksel Alpay and contributors
- * All rights reserved.
+ * Copyright The AdaptiveCpp Contributors
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- * 1. Redistributions of source code must retain the above copyright notice, this
- *    list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright notice,
- *    this list of conditions and the following disclaimer in the documentation
- *    and/or other materials provided with the distribution.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
- * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
- * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
- * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
- * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
- * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
- * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ * AdaptiveCpp is released under the BSD 2-Clause "Simplified" License.
+ * See file LICENSE in the project root for full license details.
  */
-
+// SPDX-License-Identifier: BSD-2-Clause
 #include "hipSYCL/common/filesystem.hpp"
+#include "hipSYCL/common/appdb.hpp"
 #include "hipSYCL/common/config.hpp"
 #include "hipSYCL/common/stable_running_hash.hpp"
 #include "hipSYCL/common/debug.hpp"
 
+#include "hipSYCL/runtime/settings.hpp"
+
 #include <fstream>
+#include <memory>
 #include <random>
 #include <cassert>
 
@@ -132,6 +119,14 @@ std::vector<std::string> list_regular_files(const std::string& directory,
   return result;
 }
 
+bool exists(const std::string& path) {
+  return fs::exists(path);
+}
+
+std::string absolute(const std::string& path) {
+  return fs::absolute(path).string();
+}
+
 bool atomic_write(const std::string &filename, const std::string &data) {
   fs::path p{filename};
 
@@ -158,7 +153,7 @@ bool remove(const std::string &filename) {
   return false;
 }
 
-tuningdb::tuningdb() {
+persistent_storage::persistent_storage() {
 #ifndef _WIN32
 
   auto get_home = [](std::string &home_out, std::string &subdirectory) -> bool {
@@ -184,11 +179,13 @@ tuningdb::tuningdb() {
     return false;
   };
 
-  std::string home, subdirectory;
-  if(get_home(home, subdirectory)) {
-    _base_dir = (fs::path{home} / subdirectory).string();
-  } else {
-    _base_dir = (fs::current_path() / ".acpp").string();
+  if(!rt::try_get_environment_variable("appdb_dir", _base_dir)) {
+    std::string home, subdirectory;
+    if (get_home(home, subdirectory)) {
+      _base_dir = (fs::path{home} / subdirectory).string();
+    } else {
+      _base_dir = (fs::current_path() / ".acpp").string();
+    }
   }
 
   auto get_app_path = []() -> std::string{
@@ -203,16 +200,7 @@ tuningdb::tuningdb() {
   };
 
   std::string app_path = get_app_path();
-  std::string app_subdirectory = "global";
-  if(!app_path.empty()) {
-    std::string app_filename = fs::path{app_path}.filename().string();
-
-    stable_running_hash h;
-    h(app_path.data(), app_path.size());
-    app_subdirectory = app_filename + "-" + std::to_string(h.get_current_hash());
-  }
-
-  _this_app_dir = (fs::path{_base_dir} / "apps" / app_subdirectory).string();
+  _this_app_dir = generate_app_dir(app_path);
   
 #else
   _base_dir = (fs::current_path() / ".acpp").string();
@@ -224,6 +212,34 @@ tuningdb::tuningdb() {
   fs::create_directories(_base_dir);
   fs::create_directories(_this_app_dir);
   fs::create_directories(_jit_cache_dir);
+
+#ifndef _WIN32
+  _this_app_db = std::make_unique<db::appdb>(generate_appdb_path(app_path));
+#else
+  _this_app_db = std::make_unique<db::appdb>(generate_appdb_path(""));
+#endif
+}
+
+std::string persistent_storage::generate_app_dir(const std::string& app_path) const {
+  std::string app_subdirectory = "global";
+  if(!app_path.empty()) {
+    std::string app_filename = fs::path{app_path}.filename().string();
+
+    stable_running_hash h;
+    h(app_path.data(), app_path.size());
+    app_subdirectory = app_filename + "-" + std::to_string(h.get_current_hash());
+  }
+
+  return (fs::path{_base_dir} / "apps" / app_subdirectory).string();
+}
+
+std::string persistent_storage::generate_app_db_filename() const {
+  auto version = db::appdb::format_version;
+  return "app.v"+std::to_string(version)+".db";
+}
+
+std::string persistent_storage::generate_appdb_path(const std::string& app_path) const {
+  return join_path(generate_app_dir(app_path), generate_app_db_filename());
 }
 
 }

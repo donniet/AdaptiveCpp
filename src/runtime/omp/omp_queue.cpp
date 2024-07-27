@@ -1,34 +1,17 @@
 /*
- * This file is part of hipSYCL, a SYCL implementation based on CUDA/HIP
+ * This file is part of AdaptiveCpp, an implementation of SYCL and C++ standard
+ * parallelism for CPUs and GPUs.
  *
- * Copyright (c) 2020 Aksel Alpay and contributors
- * All rights reserved.
+ * Copyright The AdaptiveCpp Contributors
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- * 1. Redistributions of source code must retain the above copyright notice,
- * this list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright notice,
- *    this list of conditions and the following disclaimer in the documentation
- *    and/or other materials provided with the distribution.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
+ * AdaptiveCpp is released under the BSD 2-Clause "Simplified" License.
+ * See file LICENSE in the project root for full license details.
  */
-
+// SPDX-License-Identifier: BSD-2-Clause
 #include "hipSYCL/runtime/omp/omp_queue.hpp"
 
 #include "hipSYCL/common/debug.hpp"
+#include "hipSYCL/common/spin_lock.hpp"
 #include "hipSYCL/runtime/application.hpp"
 #include "hipSYCL/runtime/error.hpp"
 #include "hipSYCL/runtime/event.hpp"
@@ -45,7 +28,7 @@
 
 #ifdef HIPSYCL_WITH_SSCP_COMPILER
 #include "hipSYCL/compiler/llvm-to-backend/host/LLVMToHostFactory.hpp"
-#include "hipSYCL/glue/kernel_configuration.hpp"
+#include "hipSYCL/runtime/kernel_configuration.hpp"
 #include "hipSYCL/glue/llvm-sscp/jit.hpp"
 #include "hipSYCL/runtime/adaptivity_engine.hpp"
 #include "hipSYCL/runtime/omp/omp_code_object.hpp"
@@ -272,7 +255,7 @@ std::shared_ptr<dag_node_event> omp_queue::create_queue_completion_event() {
       this);
 }
 
-result omp_queue::submit_memcpy(memcpy_operation &op, dag_node_ptr node) {
+result omp_queue::submit_memcpy(memcpy_operation &op, const dag_node_ptr& node) {
   HIPSYCL_DEBUG_INFO << "omp_queue: Submitting memcpy operation..."
                      << std::endl;
 
@@ -361,7 +344,7 @@ result omp_queue::submit_memcpy(memcpy_operation &op, dag_node_ptr node) {
     });
   } else {
     return register_error(
-        __hipsycl_here(),
+        __acpp_here(),
         error_info{"omp_queue: OpenMP CPU backend cannot transfer data between "
                    "host and accelerators.",
                    error_type::feature_not_supported});
@@ -370,33 +353,26 @@ result omp_queue::submit_memcpy(memcpy_operation &op, dag_node_ptr node) {
   return make_success();
 }
 
-result omp_queue::submit_kernel(kernel_operation &op, dag_node_ptr node) {
+result omp_queue::submit_kernel(kernel_operation &op, const dag_node_ptr& node) {
   HIPSYCL_DEBUG_INFO << "omp_queue: Submitting kernel..." << std::endl;
-
-  rt::backend_kernel_launcher *launcher =
-      op.get_launcher().find_launcher(_backend_id);
-
-  if (!launcher) {
-    return register_error(
-        __hipsycl_here(),
-        error_info{"omp_queue: Could not find required kernel launcher",
-                   error_type::runtime_error});
-  }
 
   rt::backend_kernel_launch_capabilities cap;
   cap.provide_sscp_invoker(&_sscp_code_object_invoker);
-  launcher->set_backend_capabilities(cap);
 
-  rt::dag_node *node_ptr = node.get();
-  const glue::kernel_configuration *config =
+  const kernel_configuration *config =
       &(op.get_launcher().get_kernel_configuration());
+  
+  auto backend_id = _backend_id;
+  void* params = this;
+  rt::dag_node* node_ptr = node.get();
 
   omp_instrumentation_setup instrumentation_setup{op, node};
-  _worker([=]() {
+  _worker([=, &op]() {
     auto instrumentation_guard = instrumentation_setup.instrument_task();
 
-    HIPSYCL_DEBUG_INFO << "omp_queue [async]: Invoking kernel!" << std::endl;
-    launcher->invoke(node_ptr, *config);
+    auto err = op.get_launcher().invoke(backend_id, params, cap, node_ptr);
+    if(!err.is_success())
+      rt::register_error(err);
   });
 
   return make_success();
@@ -404,38 +380,46 @@ result omp_queue::submit_kernel(kernel_operation &op, dag_node_ptr node) {
 
 result omp_queue::submit_sscp_kernel_from_code_object(
     const kernel_operation &op, hcf_object_id hcf_object,
-    const std::string &kernel_name, const rt::range<3> &num_groups,
-    const rt::range<3> &group_size, unsigned local_mem_size, void **args,
-    std::size_t *arg_sizes, std::size_t num_args,
-    const glue::kernel_configuration &initial_config) {
+    std::string_view kernel_name, const rt::hcf_kernel_info *kernel_info,
+    const rt::range<3> &num_groups, const rt::range<3> &group_size,
+    unsigned local_mem_size, void **args, std::size_t *arg_sizes,
+    std::size_t num_args, const kernel_configuration &initial_config) {
 #ifdef HIPSYCL_WITH_SSCP_COMPILER
+  common::spin_lock_guard lock{_sscp_submission_spin_lock};
 
-  const hcf_kernel_info *kernel_info =
-      rt::hcf_cache::get().get_kernel_info(hcf_object, kernel_name);
   if (!kernel_info) {
     return make_error(
-        __hipsycl_here(),
+        __acpp_here(),
         error_info{"omp_queue: Could not obtain hcf kernel info for kernel " +
-                   kernel_name});
+                   std::string{kernel_name}});
+  }
+
+
+  _arg_mapper.construct_mapping(*kernel_info, args, arg_sizes, num_args);
+
+  if (!_arg_mapper.mapping_available()) {
+    return make_error(
+        __acpp_here(),
+        error_info{
+            "omp_queue: Could not map C++ arguments to kernel arguments"});
   }
 
   kernel_adaptivity_engine adaptivity_engine{
-      hcf_object, kernel_name, kernel_info, num_groups,
+      hcf_object, kernel_name, kernel_info, _arg_mapper, num_groups,
       group_size, args,        arg_sizes,   num_args, local_mem_size};
 
-  static thread_local glue::kernel_configuration config;
-  config = initial_config;
+  _config = initial_config;
   
-  config.append_base_configuration(
-      glue::kernel_base_config_parameter::backend_id, backend_id::omp);
-  config.append_base_configuration(
-      glue::kernel_base_config_parameter::compilation_flow,
+  _config.append_base_configuration(
+      kernel_base_config_parameter::backend_id, backend_id::omp);
+  _config.append_base_configuration(
+      kernel_base_config_parameter::compilation_flow,
       compilation_flow::sscp);
-  config.append_base_configuration(
-      glue::kernel_base_config_parameter::hcf_object_id, hcf_object);
+  _config.append_base_configuration(
+      kernel_base_config_parameter::hcf_object_id, hcf_object);
 
   auto binary_configuration_id =
-      adaptivity_engine.finalize_binary_configuration(config);
+      adaptivity_engine.finalize_binary_configuration(_config);
   auto code_object_configuration_id = binary_configuration_id;
 
   auto get_image_and_kernel_names =
@@ -455,7 +439,7 @@ result omp_queue::submit_sscp_kernel_from_code_object(
 
     // Lower kernels to binary
     auto err = glue::jit::compile(translator.get(), hcf, selected_image_name,
-                                  config, compiled_image);
+                                  _config, compiled_image);
 
     if (!err.is_success()) {
       register_error(err);
@@ -470,7 +454,7 @@ result omp_queue::submit_sscp_kernel_from_code_object(
     get_image_and_kernel_names(kernel_names);
 
     omp_sscp_executable_object *exec_obj = new omp_sscp_executable_object{
-        binary_image, hcf_object, kernel_names, config};
+        binary_image, hcf_object, kernel_names, _config};
     result r = exec_obj->get_build_result();
 
     if (!r.is_success()) {
@@ -491,7 +475,7 @@ result omp_queue::submit_sscp_kernel_from_code_object(
       code_object_constructor);
 
   if (!obj) {
-    return make_error(__hipsycl_here(),
+    return make_error(__acpp_here(),
                       error_info{"omp_queue: Code object construction failed"});
   }
 
@@ -499,27 +483,18 @@ result omp_queue::submit_sscp_kernel_from_code_object(
       static_cast<const omp_sscp_executable_object *>(obj)->get_kernel(
           kernel_name);
 
-  glue::jit::cxx_argument_mapper arg_mapper{*kernel_info, args, arg_sizes,
-                                            num_args};
-  if (!arg_mapper.mapping_available()) {
-    return make_error(
-        __hipsycl_here(),
-        error_info{
-            "omp_queue: Could not map C++ arguments to kernel arguments"});
-  }
-
   return launch_kernel_from_so(kernel, num_groups, group_size, local_mem_size,
-                               arg_mapper.get_mapped_args());
+                               _arg_mapper.get_mapped_args());
 
 #else
   return make_error(
-      __hipsycl_here(),
+      __acpp_here(),
       error_info{"omp_queue: SSCP kernel launch was requested, but hipSYCL was "
                  "not built with CPU SSCP support."});
 #endif
 }
 
-result omp_queue::submit_prefetch(prefetch_operation &op, dag_node_ptr node) {
+result omp_queue::submit_prefetch(prefetch_operation &op, const dag_node_ptr& node) {
   HIPSYCL_DEBUG_INFO
       << "omp_queue: Received prefetch submission request, ignoring"
       << std::endl;
@@ -535,14 +510,14 @@ result omp_queue::submit_prefetch(prefetch_operation &op, dag_node_ptr node) {
   return make_success();
 }
 
-result omp_queue::submit_memset(memset_operation &op, dag_node_ptr node) {
+result omp_queue::submit_memset(memset_operation &op, const dag_node_ptr& node) {
   void *ptr = op.get_pointer();
   std::size_t bytes = op.get_num_bytes();
   int pattern = op.get_pattern();
 
   if (!ptr) {
     return register_error(
-        __hipsycl_here(),
+        __acpp_here(),
         error_info{
             "omp_queue: submit_memset(): Invalid argument, pointer is null."});
   }
@@ -559,13 +534,13 @@ result omp_queue::submit_memset(memset_operation &op, dag_node_ptr node) {
 
 /// Causes the queue to wait until an event on another queue has occured.
 /// the other queue must be from the same backend
-result omp_queue::submit_queue_wait_for(dag_node_ptr node) {
+result omp_queue::submit_queue_wait_for(const dag_node_ptr& node) {
   HIPSYCL_DEBUG_INFO << "omp_queue: Submitting wait for other queue..."
                      << std::endl;
   auto evt = node->get_event();
   if (!evt) {
     return register_error(
-        __hipsycl_here(),
+        __acpp_here(),
         error_info{"omp_queue: event for synchronization is null.",
                    error_type::invalid_parameter_error});
   }
@@ -585,13 +560,13 @@ result omp_queue::query_status(inorder_queue_status &status) {
   return make_success();
 }
 
-result omp_queue::submit_external_wait_for(dag_node_ptr node) {
+result omp_queue::submit_external_wait_for(const dag_node_ptr& node) {
   HIPSYCL_DEBUG_INFO << "omp_queue: Submitting wait for external node..."
                      << std::endl;
 
   if (!node) {
     return register_error(
-        __hipsycl_here(),
+        __acpp_here(),
         error_info{"omp_queue: node for synchronization is null.",
                    error_type::invalid_parameter_error});
   }
@@ -614,11 +589,12 @@ result omp_sscp_code_object_invoker::submit_kernel(
     const kernel_operation &op, hcf_object_id hcf_object,
     const rt::range<3> &num_groups, const rt::range<3> &group_size,
     unsigned local_mem_size, void **args, std::size_t *arg_sizes,
-    std::size_t num_args, const std::string &kernel_name,
-    const glue::kernel_configuration &config) {
+    std::size_t num_args, std::string_view kernel_name,
+    const rt::hcf_kernel_info *kernel_info,
+    const kernel_configuration &config) {
 
   return _queue->submit_sscp_kernel_from_code_object(
-      op, hcf_object, kernel_name, num_groups, group_size,
+      op, hcf_object, kernel_name, kernel_info, num_groups, group_size,
       local_mem_size, args, arg_sizes, num_args, config);
 }
 

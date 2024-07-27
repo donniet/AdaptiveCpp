@@ -1,30 +1,13 @@
 /*
- * This file is part of hipSYCL, a SYCL implementation based on CUDA/HIP
+ * This file is part of AdaptiveCpp, an implementation of SYCL and C++ standard
+ * parallelism for CPUs and GPUs.
  *
- * Copyright (c) 2018-2022 Aksel Alpay
- * All rights reserved.
+ * Copyright The AdaptiveCpp Contributors
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- * 1. Redistributions of source code must retain the above copyright notice, this
- *    list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright notice,
- *    this list of conditions and the following disclaimer in the documentation
- *    and/or other materials provided with the distribution.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
- * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
- * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
- * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
- * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
- * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
- * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ * AdaptiveCpp is released under the BSD 2-Clause "Simplified" License.
+ * See file LICENSE in the project root for full license details.
  */
-
+// SPDX-License-Identifier: BSD-2-Clause
 #ifndef HIPSYCL_KERNEL_CONFIGURATION_HPP
 #define HIPSYCL_KERNEL_CONFIGURATION_HPP
 
@@ -40,12 +23,14 @@
 #include <cassert>
 #include <optional>
 #include <unordered_map>
+#include <string_view>
 
 #include "hipSYCL/common/stable_running_hash.hpp"
+#include "hipSYCL/glue/llvm-sscp/fcall_specialization.hpp"
 
 
 namespace hipsycl {
-namespace glue {
+namespace rt {
 
 enum class kernel_base_config_parameter : int {
   backend_id = 0,
@@ -84,100 +69,18 @@ enum class kernel_build_flag : int {
   spirv_enable_intel_llvm_spirv_options
 };
 
-class string_build_config_mapper {
-public:
-  string_build_config_mapper() {
-    _options =  {
-      {"known-group-size-x", kernel_build_option::known_group_size_x},
-      {"known-group-size-y", kernel_build_option::known_group_size_y},
-      {"known-group-size-z", kernel_build_option::known_group_size_z},
-      {"known-local-mem-size", kernel_build_option::known_local_mem_size},
-      {"ptx-version", kernel_build_option::ptx_version},
-      {"ptx-target-device", kernel_build_option::ptx_target_device},
-      {"amdgpu-target-device", kernel_build_option::amdgpu_target_device},
-      {"rocm-device-libs-path", kernel_build_option::amdgpu_rocm_device_libs_path},
-      {"rocm-path", kernel_build_option::amdgpu_rocm_path},
-      {"spirv-dynamic-local-mem-allocation-size", kernel_build_option::spirv_dynamic_local_mem_allocation_size}
-    };
 
-    _flags = {
-      {"global-sizes-fit-in-int", kernel_build_flag::global_sizes_fit_in_int},
-      {"fast-math", kernel_build_flag::fast_math},
-      {"ptx-ftz", kernel_build_flag::ptx_ftz},
-      {"ptx-approx-div", kernel_build_flag::ptx_approx_div},
-      {"ptx-approx-sqrt", kernel_build_flag::ptx_approx_sqrt},
-      {"spirv-enable-intel-llvm-spirv-options", kernel_build_flag::spirv_enable_intel_llvm_spirv_options}
-    };
 
-    for(const auto& elem : _options) {
-      _inverse_options[elem.second] = elem.first;
-    }
+std::string to_string(kernel_build_flag f);
 
-    for(const auto& elem : _flags) {
-      _inverse_flags[elem.second] = elem.first;
-    }
-  }
+std::string to_string(kernel_build_option o);
 
-  static const auto& string_to_build_option_map() {
-    return get()._options;
-  }
+std::optional<kernel_build_option>
+to_build_option(const std::string& s);
 
-  static const auto& string_to_build_flag_map() {
-    return get()._flags;
-  }
+std::optional<kernel_build_flag>
+to_build_flag(const std::string& s);
 
-  static const auto& build_option_to_string_map() {
-    return get()._inverse_options;
-  }
-
-  static const auto& build_flag_to_string_map() {
-    return get()._inverse_flags;
-  }
-private:
-  static string_build_config_mapper& get() {
-    static string_build_config_mapper mapper;
-    return mapper;
-  }
-
-  std::unordered_map<std::string, kernel_build_option> _options;
-  std::unordered_map<std::string, kernel_build_flag> _flags;
-  std::unordered_map<kernel_build_option, std::string> _inverse_options;
-  std::unordered_map<kernel_build_flag, std::string> _inverse_flags;
-};
-
-inline std::string to_string(kernel_build_flag f) {
-  const auto& map = string_build_config_mapper::build_flag_to_string_map();
-  auto it = map.find(f);
-  if(it == map.end())
-    return {};
-  return it->second;
-}
-
-inline std::string to_string(kernel_build_option o) {
-  const auto& map = string_build_config_mapper::build_option_to_string_map();
-  auto it = map.find(o);
-  if(it == map.end())
-    return {};
-  return it->second;
-}
-
-inline std::optional<kernel_build_option>
-to_build_option(const std::string& s) {
-  const auto& map = string_build_config_mapper::string_to_build_option_map();
-  auto it = map.find(s);
-  if(it == map.end())
-    return {};
-  return it->second;
-}
-
-inline std::optional<kernel_build_flag>
-to_build_flag(const std::string& s) {
-  const auto& map = string_build_config_mapper::string_to_build_flag_map();
-  auto it = map.find(s);
-  if(it == map.end())
-    return {};
-  return it->second;
-}
 
 class kernel_configuration {
 
@@ -256,6 +159,16 @@ public:
     _s2_ir_configurations.push_back(entry);
   }
 
+  void set_specialized_kernel_argument(int param_index, uint64_t buffer_value) {
+    _specialized_kernel_args.push_back(
+        std::make_pair(param_index, buffer_value));
+  }
+
+  void set_function_call_specialization_config(
+      int param_index, glue::sscp::fcall_config_kernel_property_t config) {
+    _function_call_specializations.push_back(config);
+  }
+
   void set_build_option(kernel_build_option option, const std::string& value) {
     int_or_string ios;
     ios.string_value = value;
@@ -323,6 +236,19 @@ public:
                         "", 0);
     }
 
+    for(const auto& entry : _specialized_kernel_args) {
+      uint64_t numeric_option_id = static_cast<uint64_t>(entry.first) | (1ull << 34);
+      add_entry_to_hash(result, &numeric_option_id, sizeof(numeric_option_id),
+                        &entry.second, sizeof(entry.second));
+    }
+
+    for(int i = 0; i < _function_call_specializations.size(); ++i) {
+      uint64_t numeric_option_id = static_cast<uint64_t>(i) | (1ull << 35);
+      uint64_t config_id = _function_call_specializations[i].value->unique_hash;
+      add_entry_to_hash(result, &numeric_option_id, sizeof(numeric_option_id),
+                        &config_id, sizeof(config_id));
+    }
+
     return result;
   }
 
@@ -338,12 +264,24 @@ public:
     return _build_flags;
   }
 
+  const auto& specialized_arguments() const {
+    return _specialized_kernel_args;
+  }
+
+  const auto& function_call_specialization_config() const {
+    return _function_call_specializations;
+  }
+
 private:
   static const void* data_ptr(const char* data) {
     return data_ptr(std::string{data});
   }
 
   static const void* data_ptr(const std::string& data) {
+    return data.data();
+  }
+
+  static const void* data_ptr(std::string_view data) {
     return data.data();
   }
 
@@ -362,6 +300,10 @@ private:
   }
 
   static std::size_t data_size(const std::string& data) {
+    return data.size();
+  }
+
+  static std::size_t data_size(std::string_view data) {
     return data.size();
   }
 
@@ -389,6 +331,9 @@ private:
   std::vector<s2_ir_configuration_entry> _s2_ir_configurations;
   std::vector<kernel_build_flag> _build_flags;
   std::vector<std::pair<kernel_build_option, int_or_string>> _build_options;
+  std::vector<std::pair<int, uint64_t>> _specialized_kernel_args;
+  std::vector<glue::sscp::fcall_config_kernel_property_t>
+      _function_call_specializations;
 
   id_type _base_configuration_result = {};
 };

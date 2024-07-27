@@ -1,30 +1,13 @@
 /*
- * This file is part of hipSYCL, a SYCL implementation based on CUDA/HIP
+ * This file is part of AdaptiveCpp, an implementation of SYCL and C++ standard
+ * parallelism for CPUs and GPUs.
  *
- * Copyright (c) 2019-2021 Aksel Alpay
- * All rights reserved.
+ * Copyright The AdaptiveCpp Contributors
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- * 1. Redistributions of source code must retain the above copyright notice, this
- *    list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright notice,
- *    this list of conditions and the following disclaimer in the documentation
- *    and/or other materials provided with the distribution.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
- * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
- * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
- * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
- * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
- * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
- * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ * AdaptiveCpp is released under the BSD 2-Clause "Simplified" License.
+ * See file LICENSE in the project root for full license details.
  */
-
+// SPDX-License-Identifier: BSD-2-Clause
 #include <sstream>
 #include <string>
 #include <algorithm>
@@ -35,7 +18,7 @@
 #include <cuda.h>
 
 #include "hipSYCL/common/hcf_container.hpp"
-#include "hipSYCL/glue/kernel_configuration.hpp"
+#include "hipSYCL/runtime/kernel_configuration.hpp"
 #include "hipSYCL/runtime/cuda/cuda_code_object.hpp"
 #include "hipSYCL/runtime/cuda/cuda_device_manager.hpp"
 #include "hipSYCL/runtime/device_id.hpp"
@@ -66,13 +49,13 @@ void unload_cuda_module(CUmod_st* module, int device) {
 
     auto err = cuModuleUnload(module);
 
-    if (err != CUDA_SUCCESS && 
+    if (err != CUDA_SUCCESS &&
         // It can happen that during shutdown of the CUDA
         // driver we cannot unload anymore.
         // TODO: Find a better solution
         err != CUDA_ERROR_DEINITIALIZED) {
       register_error(
-          __hipsycl_here(),
+          __acpp_here(),
           error_info{"cuda_executable_object: could not unload module",
                      error_code{"CU", static_cast<int>(err)}});
     }
@@ -81,30 +64,49 @@ void unload_cuda_module(CUmod_st* module, int device) {
 
 result build_cuda_module_from_ptx(CUmod_st *&module, int device,
                                   const std::string &source) {
-  
+
   cuda_device_manager::get().activate_device(device);
   // This guarantees that the CUDA runtime API initializes the CUDA
   // context on that device. This is important for the subsequent driver
   // API calls which assume that CUDA context has been created.
   cudaFree(0);
-  
+
+  static constexpr std::size_t num_options = 2;
+  std::array<CUjit_option, num_options> option_names{};
+  std::array<void*, num_options> option_vals{};
+
+  // set up size of compilation log buffer
+  option_names[0] = CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES;
+  static constexpr std::size_t error_log_buffer_size = 10*1024;
+  option_vals[0] = reinterpret_cast<void*>(error_log_buffer_size);
+
+  // set up pointer to the compilation log buffer
+  option_names[1] = CU_JIT_ERROR_LOG_BUFFER;
+  std::string error_log_buffer(error_log_buffer_size, '\0');
+  option_vals[1] = error_log_buffer.data();
+
   auto err = cuModuleLoadDataEx(
-      &module, static_cast<void *>(const_cast<char *>(source.c_str())),
-      0, nullptr, nullptr);
+      &module, source.data(),
+      num_options, option_names.data(), option_vals.data());
 
   if (err != CUDA_SUCCESS) {
-    return make_error(__hipsycl_here(),
-                      error_info{"cuda_executable_object: could not load module",
-                                error_code{"CU", static_cast<int>(err)}});
+    const auto error_log_size = reinterpret_cast<std::size_t>(option_vals[0]);
+    error_log_buffer.resize(error_log_size);
+    return make_error(
+        __acpp_here(),
+        error_info{
+            "cuda_executable_object: Could not load module, CUDA JIT log: " +
+                error_log_buffer,
+            error_code{"CU", static_cast<int>(err)}});
   }
-  
+
   assert(module);
 
   return make_success();
 }
 
 std::vector<std::string> extract_kernel_names_from_ptx(const std::string& source) {
-  
+
   std::vector<std::string> kernel_names;
   std::istringstream code_stream(source);
   std::string line;
@@ -203,7 +205,7 @@ int cuda_multipass_executable_object::get_device() const {
 cuda_sscp_executable_object::cuda_sscp_executable_object(
     const std::string &ptx_source, const std::string &target_arch,
     hcf_object_id hcf_source, const std::vector<std::string> &kernel_names,
-    int device, const glue::kernel_configuration &config)
+    int device, const kernel_configuration &config)
     : _target_arch{target_arch}, _hcf{hcf_source}, _kernel_names{kernel_names},
       _id{config.generate_id()}, _device{device}, _module{nullptr} {
   _build_result = build(ptx_source);
